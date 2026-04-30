@@ -1,13 +1,14 @@
 export const config = { runtime: "edge" };
 
-const TARGET_BASE = (process.env.TARGET_DOMAIN || "").replace(/\/$/, "");
+const DESTINATION_BASE = (process.env.UPSTREAM_URL || "").replace(/\/$/, "");
 
-const STRIP_HEADERS = new Set([
+// اگر خواستی IP کاربر پاس داده بشه، اینو true کن
+const FORWARD_CLIENT_IP = false;
+
+const BLOCKED_HEADERS = new Set([
   "host",
   "connection",
   "keep-alive",
-  "proxy-authenticate",
-  "proxy-authorization",
   "te",
   "trailer",
   "transfer-encoding",
@@ -16,49 +17,77 @@ const STRIP_HEADERS = new Set([
   "x-forwarded-host",
   "x-forwarded-proto",
   "x-forwarded-port",
+  "x-real-ip",
+  "cf-connecting-ip",
+  "true-client-ip",
 ]);
 
-export default async function handler(req) {
-  if (!TARGET_BASE) {
-    return new Response("TARGET_DOMAIN not set", { status: 500 });
+export default async function requestHandler(request) {
+  if (!DESTINATION_BASE) {
+    return new Response("UPSTREAM_URL not set", { status: 500 });
   }
 
   try {
-    const url = new URL(req.url);
-    const targetUrl = TARGET_BASE + url.pathname + url.search;
+    const incomingUrl = new URL(request.url);
+    const destinationUrl =
+      DESTINATION_BASE + incomingUrl.pathname + incomingUrl.search;
 
-    const headers = new Headers();
+    const outgoingHeaders = new Headers();
 
-    let clientIp;
+    let detectedIp;
 
-    for (const [key, value] of req.headers) {
-      const k = key.toLowerCase();
+    for (const [headerName, headerValue] of request.headers) {
+      const key = headerName.toLowerCase();
 
-      if (STRIP_HEADERS.has(k)) continue;
-      if (k.startsWith("x-vercel-")) continue;
+      if (BLOCKED_HEADERS.has(key)) continue;
+      if (key.startsWith("x-vercel-")) continue;
 
-      if (k === "x-real-ip") clientIp = value;
-      else if (k === "x-forwarded-for") clientIp ||= value;
-      else headers.set(key, value);
+      if (
+        FORWARD_CLIENT_IP &&
+        (key === "x-forwarded-for" || key === "x-real-ip")
+      ) {
+        detectedIp ||= headerValue;
+        continue;
+      }
+
+      outgoingHeaders.set(headerName, headerValue);
     }
 
-    if (clientIp) headers.set("x-forwarded-for", clientIp);
+    if (FORWARD_CLIENT_IP && detectedIp) {
+      outgoingHeaders.set("x-forwarded-for", detectedIp);
+    }
 
-    const isBody = req.method !== "GET" && req.method !== "HEAD";
+    const hasBody =
+      request.method !== "GET" && request.method !== "HEAD";
 
-    const res = await fetch(targetUrl, {
-      method: req.method,
-      headers,
-      body: isBody ? req.body : undefined,
+    const upstreamResponse = await fetch(destinationUrl, {
+      method: request.method,
+      headers: outgoingHeaders,
+      body: hasBody ? request.body : undefined,
       redirect: "manual",
     });
 
-    return new Response(res.body, {
-      status: res.status,
-      headers: res.headers,
+    const responseHeaders = new Headers(upstreamResponse.headers);
+
+    responseHeaders.delete("x-powered-by");
+    responseHeaders.delete("server");
+
+    responseHeaders.set("x-frame-options", "DENY");
+    responseHeaders.set("x-content-type-options", "nosniff");
+    responseHeaders.set("referrer-policy", "no-referrer");
+
+    return new Response(upstreamResponse.body, {
+      status: upstreamResponse.status,
+      headers: responseHeaders,
     });
-  } catch (err) {
-    console.error(err);
-    return new Response("Bad Gateway", { status: 502 });
+  } catch (error) {
+    console.error("Request failed:", error);
+
+    return new Response("Bad Gateway", {
+      status: 502,
+      headers: {
+        "content-type": "text/plain",
+      },
+    });
   }
 }
